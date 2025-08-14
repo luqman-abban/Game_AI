@@ -1,38 +1,21 @@
 import streamlit as st
-import time, sys, subprocess, traceback
+import time
 from playwright.sync_api import sync_playwright, Error as PWError
 
-st.set_page_config(page_title="Online Game Auto-Player (Streamlit)", layout="wide")
-st.title("Online Game Auto-Player (Streamlit)")
-st.caption("Loads an online game in a headless Chromium via Playwright and streams frames.")
+st.set_page_config(page_title="Online Game Auto-Player", layout="wide")
+st.title("🎮 Online Game Auto-Player")
+st.caption("Plays online games in headless Chromium using Playwright")
 
 DEFAULT_URL = "https://play2048.co"
 MOVE_ORDERS = {
     "Up/Left Bias": ["ArrowUp", "ArrowLeft", "ArrowRight", "ArrowDown"],
     "Left/Down Bias": ["ArrowLeft", "ArrowDown", "ArrowRight", "ArrowUp"],
-    "Clockwise": ["ArrowUp", "ArrowRight", "Down", "ArrowLeft"],
+    "Clockwise": ["ArrowUp", "ArrowRight", "ArrowDown", "ArrowLeft"],
 }
-
-def ensure_pw_chromium():
-    if not st.session_state.get("pw_installed"):
-        st.info("Installing Playwright Chromium...")
-        try:
-            result = subprocess.run(
-                [sys.executable, "-m", "playwright", "install", "chromium"],
-                check=True,
-                capture_output=True,
-                text=True
-            )
-            st.info(result.stdout)
-        except subprocess.CalledProcessError as e:
-            st.error("Chromium installation failed")
-            st.code(f"Error: {e.stderr}", language="text")
-            st.stop()
-        st.session_state["pw_installed"] = True
 
 def get_score(page):
     try:
-        txt = page.locator(".score-container").inner_text().strip()
+        txt = page.locator(".score-container").inner_text(timeout=1000).strip()
         return int(txt.split()[0].replace(",", ""))
     except Exception:
         return 0
@@ -51,15 +34,13 @@ def board_signature(page):
         return ""
 
 def autoplay(url: str, moves: int, fps: int, strategy: str):
-    ensure_pw_chromium()
-
-    move_order = MOVE_ORDERS[strategy].copy()
-    frame_delay = max(0.07, 1.0 / max(1, fps))
-
     img_ph = st.empty()
     logs_ph = st.empty()
-    logs = [f"Loaded URL: {url}"]
-    last_frame = 0.0
+    logs = [f"Loading: {url}"]
+    logs_ph.code("\n".join(logs), language="text")
+    
+    frame_delay = max(0.1, 1.0 / max(1, fps))
+    move_order = MOVE_ORDERS[strategy].copy()
 
     try:
         with sync_playwright() as p:
@@ -67,84 +48,78 @@ def autoplay(url: str, moves: int, fps: int, strategy: str):
                 headless=True,
                 args=["--no-sandbox", "--disable-setuid-sandbox"]
             )
-            page = browser.new_page(viewport={"width": 850, "height": 1000})
-            page.goto(url, wait_until="load", timeout=60_000)
-            page.mouse.click(50, 50)
-
-            img_ph.image(page.screenshot(full_page=True), caption="Live view")
+            context = browser.new_context(viewport={"width": 500, "height": 700})
+            page = context.new_page()
+            
+            page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            page.wait_for_timeout(1000)  # Initial load
+            
+            logs.append("Page loaded. Starting game...")
             logs_ph.code("\n".join(logs), language="text")
+            img_ph.image(page.screenshot(), caption="Initial view")
 
             last_sig = board_signature(page)
-            invalid = 0
+            invalid_count = 0
+            last_update = time.time()
 
             for i in range(moves):
                 page.keyboard.press(move_order[i % 4])
-                page.wait_for_timeout(70)
-
-                sig = board_signature(page)
-                if sig == last_sig:
-                    changed = False
-                    for alt in move_order[1:]:
-                        page.keyboard.press(alt)
-                        page.wait_for_timeout(50)
-                        new_sig = board_signature(page)
-                        if new_sig != sig:
-                            sig = new_sig
-                            changed = True
-                            break
-                    if not changed:
-                        invalid += 1
+                page.wait_for_timeout(100)  # Game response time
+                
+                # Check if board changed
+                new_sig = board_signature(page)
+                if new_sig == last_sig:
+                    invalid_count += 1
                 else:
-                    invalid = 0
-
-                score = get_score(page)
-                logs.append(f"Move {i+1:03d} | Score {score}")
-                if len(logs) > 80:
-                    logs = logs[-80:]
-
-                now = time.time()
-                if now - last_frame >= frame_delay:
-                    img_ph.image(page.screenshot(full_page=True), caption=f"Score {score}")
+                    invalid_count = 0
+                    last_sig = new_sig
+                
+                # Rotate strategy if stuck
+                if invalid_count >= 3:
+                    move_order.append(move_order.pop(0))
+                    logs.append(f"♻️ Strategy rotated: {move_order}")
+                    invalid_count = 0
+                
+                # Update UI periodically
+                current_time = time.time()
+                if current_time - last_update >= frame_delay:
+                    score = get_score(page)
+                    logs.append(f"Move {i+1}/{moves} | Score: {score}")
+                    if len(logs) > 15:
+                        logs = logs[-15:]
+                    
+                    img_ph.image(page.screenshot(), caption=f"Score: {score}")
                     logs_ph.code("\n".join(logs), language="text")
-                    last_frame = now
-
+                    last_update = current_time
+                
+                # Check game over
                 if is_game_over(page):
-                    logs.append("Game Over detected. Stopping.")
-                    img_ph.image(page.screenshot(full_page=True), caption=f"Final (Score {score})")
+                    score = get_score(page)
+                    logs.append(f"🏁 Game Over! Final score: {score}")
+                    img_ph.image(page.screenshot(), caption=f"Final Score: {score}")
                     logs_ph.code("\n".join(logs), language="text")
                     break
 
-                if invalid >= 3:
-                    first = move_order.pop(0)
-                    move_order.append(first)
-                    logs.append(f"Rotated move order -> {move_order}")
-                    invalid = 0
-
+            # Cleanup
+            context.close()
             browser.close()
 
-    except subprocess.CalledProcessError as e:
-        st.error("Chromium installer failed (playwright install chromium).")
-        st.code(str(e), language="text")
     except PWError as e:
-        st.error("Playwright error while launching or controlling Chromium.")
+        st.error("Browser error occurred")
         st.code(str(e), language="text")
-    except Exception:
-        st.error("Unexpected error.")
-        st.code(traceback.format_exc(), language="text")
+    except Exception as e:
+        st.error("Unexpected error")
+        st.code(str(e), language="text")
 
+# UI Layout
 with st.sidebar:
+    st.header("Settings")
     url = st.text_input("Game URL", DEFAULT_URL)
-    moves = st.slider("Max moves", 50, 1200, 300, 10)
-    fps = st.slider("Stream FPS", 1, 12, 5, 1)
-    strategy = st.selectbox("Move strategy", list(MOVE_ORDERS.keys()))
-    go = st.button("Start")
+    moves = st.slider("Max moves", 50, 500, 150)
+    fps = st.slider("Update Frequency (FPS)", 1, 10, 3)
+    strategy = st.selectbox("Move Strategy", list(MOVE_ORDERS.keys()))
+    
+    if st.button("▶️ Start Game", type="primary"):
+        autoplay(url, moves, fps, strategy)
 
-st.markdown("#### Live View")
-st.empty()
-st.markdown("#### Logs")
-st.empty()
-
-if go:
-    autoplay(url, moves, fps, strategy)
-else:
-    st.info("Set the options in the sidebar and click **Start**.")
+st.info("Configure settings in the sidebar and press 'Start Game'")
