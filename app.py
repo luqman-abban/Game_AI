@@ -15,8 +15,19 @@ MOVE_ORDERS = {
 
 def ensure_pw_chromium():
     if not st.session_state.get("pw_installed"):
-        st.info("Installing Playwright Chromium (first run only)…")
-        subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], check=True)
+        st.info("Installing Playwright Chromium...")
+        try:
+            result = subprocess.run(
+                [sys.executable, "-m", "playwright", "install", "chromium"],
+                check=True,
+                capture_output=True,
+                text=True
+            )
+            st.info(result.stdout)
+        except subprocess.CalledProcessError as e:
+            st.error("Chromium installation failed")
+            st.code(f"Error: {e.stderr}", language="text")
+            st.stop()
         st.session_state["pw_installed"] = True
 
 def get_score(page):
